@@ -1,0 +1,26 @@
+[project]
+name = "state-real-estate-watchdog"
+version = "0.1.0"
+description = "ETL pipeline pro extrakci státního a lesního majetku"
+authors = [
+    {name = "libor-konopka"}
+]
+requires-python = ">=3.14"
+dependencies = [
+    "aiohttp (>=3.14.0,<4.0.0)",
+    "pydantic (>=2.13.4,<3.0.0)",
+    "beautifulsoup4 (>=4.14.3,<5.0.0)",
+    "playwright (>=1.60.0,<2.0.0)"
+]
+
+
+[build-system]
+requires = ["poetry-core>=2.0.0,<3.0.0"]
+build-backend = "poetry.core.masonry.api"
+
+[dependency-groups]
+dev = [
+    "ruff (>=0.15.16,<0.16.0)",
+    "mypy (>=2.1.0,<3.0.0)",
+    "pytest (>=9.0.3,<10.0.0)"
+]
