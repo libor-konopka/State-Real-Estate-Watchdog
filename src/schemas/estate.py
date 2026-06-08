@@ -20,6 +20,10 @@ class EstateSchema(BaseModel):
         ...,
         description="Původ dat (např. 'portaldrazeb.cz', 'nabidkamajetku.gov.cz')."
     )
+    property_type: Optional[str] = Field(
+        None,
+        description="Základní klasifikace hmoty (např. 'Pozemky' nebo 'Stavby'). U neznámých zdrojů může být dočasně None.",
+    )
     title: str = Field(
         ...,
         description="Hlavní název nebo stručný popis nemovitosti."

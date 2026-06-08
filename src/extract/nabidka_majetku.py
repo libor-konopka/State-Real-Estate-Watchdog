@@ -15,27 +15,24 @@ class NabidkaMajetkuScraper(BaseScraper):
     """
     Asynchronní extraktor pro nabidkamajetku.gov.cz (ÚZSVM).
     Napojuje se na interní API /api/Property/List.
+    Zachycuje veškerou hmotu (pozemky a stavby) bez geografického omezení.
     """
 
     def __init__(self) -> None:
         super().__init__()
         self.api_url: str = "https://nabidkamajetku.gov.cz/api/Property/List"
         self.page_size: int = 25
-        # Byznysové ohraničení toku - sledujeme pouze tyto okresy
-        self.target_districts = {
-            "Benešov", "Beroun", "Kutná Hora", "Mladá Boleslav",
-            "Praha-východ", "Praha-západ", "Příbram"
-        }
+        # Geografický filtr (self.target_districts) byl odstraněn.
 
-    def _build_payload(self, page: int) -> Dict[str, Any]:
-        """Konstruuje datový záměr. CategoryId 11 odpovídá filtru na 'Nemovitosti'."""
+    def _build_payload(self, page: int, category_id: str) -> Dict[str, Any]:
+        """Konstruuje datový záměr. Nyní dynamicky přijímá ID kategorie."""
         return {
             "ListType": "all",
             "Page": page,
             "PageSize": self.page_size,
             "Order": "Default",
             "OrderDesc": "true",
-            "CategoryId": "11",
+            "CategoryId": category_id,
             "CadastreId": "0",
             "ContactZipCode": "",
             "Fulltext": "",
@@ -48,7 +45,7 @@ class NabidkaMajetkuScraper(BaseScraper):
             "OrganizationType": "0",
             "PropertyAuthor": "",
             "ShowEndedProperties": False,
-            "State": "0"
+            "State": "0",
         }
 
     def _parse_price(self, price_str: Optional[str]) -> Optional[float]:
@@ -56,19 +53,22 @@ class NabidkaMajetkuScraper(BaseScraper):
         if not price_str:
             return None
         try:
-            # Odstranění běžných mezer, nezlomitelných mezer a převod čárky na tečku
             clean_str = price_str.replace(" ", "").replace("\xa0", "").replace(",", ".")
             return float(clean_str)
         except ValueError:
             return None
 
-    def _parse_dates(self, status_str: str) -> tuple[Optional[datetime], Optional[datetime]]:
-        """Extrahuje začátek a konec aukce ze stringu typu 'Aukce vyhlášena (16.06.2026 11:00 - 17.06.2026 11:00)'."""
+    def _parse_dates(
+        self, status_str: str
+    ) -> tuple[Optional[datetime], Optional[datetime]]:
+        """Extrahuje začátek a konec aukce ze stringu."""
         if not status_str:
             return None, None
 
-        # Regulární výraz zachytí dva bloky s datem a časem
-        match = re.search(r"\((\d{2}\.\d{2}\.\d{4} \d{2}:\d{2})\s*-\s*(\d{2}\.\d{2}\.\d{4} \d{2}:\d{2})\)", status_str)
+        match = re.search(
+            r"\((\d{2}\.\d{2}\.\d{4} \d{2}:\d{2})\s*-\s*(\d{2}\.\d{2}\.\d{4} \d{2}:\d{2})\)",
+            status_str,
+        )
         if match:
             start_str, end_str = match.groups()
             try:
@@ -80,61 +80,76 @@ class NabidkaMajetkuScraper(BaseScraper):
         return None, None
 
     async def scrape(self, session: aiohttp.ClientSession) -> List[EstateSchema]:
-        """Hlavní dech extraktoru."""
+        """Hlavní dech extraktoru. Iteruje přes vymezené formy hmoty."""
         logger.info(f"📡 {self.scraper_name}: Zahajuji extrakční cyklus...")
         valid_items: List[EstateSchema] = []
-        page: int = 1
 
-        while True:
-            payload = self._build_payload(page)
-            headers = self.get_default_headers()
-            # U .NET API je dobré explicitně potvrdit typ odesílané hmoty
-            headers["Content-Type"] = "application/json;charset=UTF-8"
+        # 10 = Pozemky, 11 = Stavby
+        target_categories = ["10", "11"]
 
-            try:
-                async with session.post(self.api_url, json=payload, headers=headers) as response:
-                    response.raise_for_status()
-                    data: Dict[str, Any] = await response.json()
-            except aiohttp.ClientError as e:
-                logger.error(f"Narušení toku na stránce {page}: {e}")
-                break
+        for category_id in target_categories:
+            page: int = 1
+            logger.info(
+                f"📡 {self.scraper_name}: Otevírám datový proud pro kategorii {category_id}..."
+            )
 
-            raw_items: List[Dict[str, Any]] = data.get("Properties", [])
+            while True:
+                payload = self._build_payload(page, category_id)
+                headers = self.get_default_headers()
+                headers["Content-Type"] = "application/json;charset=UTF-8"
 
-            if not raw_items:
-                logger.info(f"{self.scraper_name}: Dosaženo prázdnoty na stránce {page}. Konec cyklu.")
-                break
+                try:
+                    async with session.post(
+                        self.api_url, json=payload, headers=headers
+                    ) as response:
+                        response.raise_for_status()
+                        data: Dict[str, Any] = await response.json()
+                except aiohttp.ClientError as e:
+                    logger.error(
+                        f"Narušení toku na stránce {page} v kategorii {category_id}: {e}"
+                    )
+                    break
 
-            logger.info(f"{self.scraper_name}: Zpracovávám {len(raw_items)} položek ze stránky {page}.")
+                raw_items: List[Dict[str, Any]] = data.get("Properties", [])
 
-            for item in raw_items:
-                parsed_estate = self._parse_item(item)
-                if parsed_estate:
-                    # Architektonická filtrace naší sledované zóny
-                    if parsed_estate.location_district in self.target_districts:
+                if not raw_items:
+                    logger.info(
+                        f"{self.scraper_name}: Dosaženo prázdnoty na stránce {page} (Kategorie {category_id})."
+                    )
+                    break
+
+                logger.info(
+                    f"{self.scraper_name}: Zpracovávám {len(raw_items)} položek ze stránky {page} (Kategorie {category_id})."
+                )
+
+                for item in raw_items:
+                    parsed_estate = self._parse_item(item, category_id)
+                    # Geografický filtr propustí veškerou hmotu.
+                    if parsed_estate:
                         valid_items.append(parsed_estate)
 
-            # API nám prozrazuje celkový počet stránek. Můžeme cyklus elegantně ukončit.
-            page_count = data.get("PageCount", 0)
-            if page >= page_count:
-                break
+                page_count = data.get("PageCount", 0)
+                if page >= page_count:
+                    break
 
-            page += 1
+                page += 1
 
         return valid_items
 
-    def _parse_item(self, raw_data: Dict[str, Any]) -> Optional[EstateSchema]:
+    def _parse_item(self, raw_data: Dict[str, Any], category_id: str) -> Optional[EstateSchema]:
         """Transformuje fragment dat do našeho centrálního kontraktu."""
         try:
             item_id = str(raw_data["Id"])
-
-            # Bezpečná extrakce složitějších uzlů
             start_dt, end_dt = self._parse_dates(raw_data.get("StatusName", ""))
             seller = raw_data.get("Organization", {}).get("u04Name")
+
+            # Exaktní určení typu na základě ID kategorie z API
+            property_type = "Pozemky" if category_id == "10" else "Stavby"
 
             return EstateSchema(
                 source_id=item_id,
                 source_portal="nabidkamajetku.gov.cz",
+                property_type=property_type,  # Mapování do schématu
                 title=raw_data.get("Name", "Neznámý název"),
                 starting_price=self._parse_price(raw_data.get("Price")),
                 estimated_price=None,
@@ -146,10 +161,12 @@ class NabidkaMajetkuScraper(BaseScraper):
                 auction_end=end_dt,
                 seller_institution=seller,
                 url=f"https://nabidkamajetku.gov.cz/Home/Detail/{item_id}",
-                area_m2=None
+                area_m2=None,
             )
         except KeyError as e:
-            logger.warning(f"Chybějící esenciální klíč {e} u záznamu {raw_data.get('Id')}")
+            logger.warning(
+                f"Chybějící esenciální klíč {e} u záznamu {raw_data.get('Id')}"
+            )
             return None
         except Exception as e:
             logger.warning(f"Chyba transformace záznamu {raw_data.get('Id')}: {e}")

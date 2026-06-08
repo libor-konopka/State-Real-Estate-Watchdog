@@ -1,0 +1,15 @@
+# Prostředí a závislosti
+.venv/
+__pycache__/
+*.py[cod]
+
+# Nastavení IDE
+.idea/
+
+# Lokální hmota a paměť (chráníme soukromí a neplníme cloud daty)
+raw_estates_dump.json
+estates.db
+
+# Dočasné soubory nástrojů
+.pytest_cache/
+.ruff_cache/

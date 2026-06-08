@@ -1,7 +1,7 @@
 import logging
 import re
 from datetime import datetime
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 import aiohttp
 from bs4 import BeautifulSoup
@@ -15,9 +15,9 @@ logger = logging.getLogger(__name__)
 
 class LesyCrScraper(BaseScraper):
     """
-    Asynchronní extraktor pro pnm.lesycr.cz.
-    Využívá headless prohlížeč pro manipulaci s APEX reportem,
-    filtruje živé záznamy a iteruje skrze stránky.
+    Asynchronní extraktor pro pnm.lesycr.cz (Strana 7).
+    Aplikuje UI filtr a využívá relativní kotevní strategii pro maximální odolnost
+    vůči strukturálním změnám APEX tabulek.
     """
 
     def __init__(self) -> None:
@@ -41,24 +41,21 @@ class LesyCrScraper(BaseScraper):
             return None
 
     def _parse_id_from_url(self, link: str) -> Optional[str]:
-        match = re.search(r"P13_ID_MAJ:(\d+)", link)
+        match = re.search(r"ID_MAJ:(\d+)", link)
         if match:
             return match.group(1)
         return None
 
     def _parse_page_content(self, html_content: str) -> List[EstateSchema]:
-        """Těží datovou hmotu z aktuálně zobrazeného DOMu s defenzivní filtrací."""
+        """Těží data pomocí precizního kotevního bodu, eliminuje historický šum i falešné shody."""
         items: List[EstateSchema] = []
         soup = BeautifulSoup(html_content, "html.parser")
+
         rows = soup.find_all("tr")
-
         for row in rows:
-            link_cell = row.find("td", headers="LINK")
-            if not link_cell:
-                continue
-
-            a_tag = link_cell.find("a")
-            if not a_tag or not a_tag.get("href"):
+            # 1. Detekce platného uzlu
+            a_tag = row.find("a", href=re.compile(r"ID_MAJ:(\d+)"))
+            if not a_tag:
                 continue
 
             href = a_tag["href"]
@@ -67,54 +64,52 @@ class LesyCrScraper(BaseScraper):
                 continue
 
             try:
-                # Kontrola typu (pouze Prodej)
-                type_cell = row.find("td", headers="C288994971869363934")
-                offer_type = type_cell.text.strip() if type_cell else ""
-                if "Prodej" not in offer_type:
+                cells = row.find_all("td")
+
+                # 2. Precizní ukotvení: Hledáme buňku, která je EXACTNĚ slovem 'Prodej'
+                anchor_idx = -1
+                for i, cell in enumerate(cells):
+                    cell_text = cell.get_text(strip=True)
+                    if cell_text == "Prodej":
+                        anchor_idx = i
+                        break
+
+                # Zvýšení ochranné hranice na 8.
+                # Pokud extrahujeme 8 prvků vlevo od kotvy, pole musí být dostatečně hluboké.
+                if anchor_idx < 8:
                     continue
 
-                # Kontrola stavu (pouze živé nabídky)
-                status_cell = row.find("td", headers="C182519181887705490")
-                status = status_cell.text.strip() if status_cell else ""
-                if "Vypsané" not in status:
-                    continue
+                # 3. Relativní extrakce parametrů vůči kotvě
+                # POZOR: Indexy musíš zkalibrovat podle skutečného pořadí sloupců na webu.
+                # Předpokládám, že Kategorie (-7) je mezi Názvem (-8) a Cenou (-6).
+                title = cells[anchor_idx - 8].text.strip()
+                raw_kategorie = cells[anchor_idx - 7].text.strip()
+                price_str = cells[anchor_idx - 6].text.strip()
+                date_str = cells[anchor_idx - 5].text.strip()
+                region = cells[anchor_idx - 4].text.strip()
+                district = cells[anchor_idx - 3].text.strip()
 
-                title_cell = row.find("td", headers="C326410314433328373")
-                title = title_cell.text.strip() if title_cell else "Neznámý název"
+                area_m2_str = cells[anchor_idx - 2].text.strip()
+                area_m2_str = "".join(filter(str.isdigit, area_m2_str))
+                area_m2 = float(area_m2_str) if area_m2_str else None
 
-                price_cell = row.find("td", headers="C326411100233328374")
-                price_str = price_cell.text.strip() if price_cell else ""
+                cadastral_area = cells[anchor_idx - 1].text.strip()
 
-                date_cell = row.find("td", headers="C326413850831328375")
-                date_str = date_cell.text.strip() if date_cell else ""
-
-                region_cell = row.find("td", headers="C326411539589328374")
-                region = region_cell.text.strip() if region_cell else None
-
-                district_cell = row.find("td", headers="C326411886832328374")
-                district = district_cell.text.strip() if district_cell else None
-
-                area_cell = row.find("td", headers="C326418281440328383")
-                area_m2_str = area_cell.text.strip() if area_cell else None
-                area_m2 = (
-                    float(area_m2_str)
-                    if area_m2_str and area_m2_str.isdigit()
-                    else None
-                )
-
-                cadastral_cell = row.find("td", headers="C326431899615328393")
-                cadastral_area = cadastral_cell.text.strip() if cadastral_cell else None
+                # Pythonic klasifikace (Ternární operátor).
+                # Cokoliv co není exaktně "Pozemky", propadá do "Stavby".
+                property_type = "Pozemky" if raw_kategorie == "Pozemky" else "Stavby"
 
                 estate = EstateSchema(
                     source_id=item_id,
                     source_portal="pnm.lesycr.cz",
-                    title=title,
+                    property_type=property_type,
+                    title=title or "Neznámý název",
                     starting_price=self._parse_price(price_str),
                     estimated_price=None,
-                    location_region=region,
-                    location_district=district,
+                    location_region=region or None,
+                    location_district=district or None,
                     location_city=None,
-                    cadastral_area=cadastral_area,
+                    cadastral_area=cadastral_area or None,
                     auction_start=None,
                     auction_end=self._parse_date(date_str),
                     seller_institution="Lesy ČR",
@@ -130,9 +125,14 @@ class LesyCrScraper(BaseScraper):
         return items
 
     async def scrape(self, session: aiohttp.ClientSession) -> List[EstateSchema]:
-        """Aktivuje prohlížeč, vnutí filtry do UI a provede rychlou extrakci platných záznamů."""
-        logger.info(f"📡 {self.scraper_name}: Zhmotňuji headless prohlížeč pro APEX...")
+        """Aktivuje prohlížeč, vynucuje UI filtr a provádí asynchronní iteraci s přísnou kontrolou mutací DOMu."""
+        logger.info(
+            f"📡 {self.scraper_name}: Zhmotňuji headless prohlížeč pro stranu 7..."
+        )
         valid_items: List[EstateSchema] = []
+        seen_ids = (
+            set()
+        )  # Ochrana proti zachycení stejných dat (tzv. "ghost" řádky při rychlém čtení)
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
@@ -145,9 +145,8 @@ class LesyCrScraper(BaseScraper):
                 await page.goto(self.base_url, wait_until="networkidle")
                 await page.wait_for_selector("table.a-IRR-table", timeout=15000)
 
-                # Vynucení filtrace přes APEX UI
                 logger.info(
-                    f"📡 {self.scraper_name}: Aplikuji filtr na živé záznamy ('Vypsané')..."
+                    f"📡 {self.scraper_name}: Zadávám omezující filtr 'Vypsané'..."
                 )
                 search_input = page.locator(".a-IRR-search-field")
                 search_button = page.locator(".a-IRR-button--search")
@@ -155,37 +154,61 @@ class LesyCrScraper(BaseScraper):
                 if await search_input.count() > 0 and await search_button.count() > 0:
                     await search_input.fill("Vypsané")
                     await search_button.click()
-                    # Vyčkání na překreslení tabulky a ustálení sítě po filtraci
+                    # Zvýšený timeout po filtru pro zajištění prvotního renderu
                     await page.wait_for_load_state("networkidle")
-                    await page.wait_for_timeout(2000)
+                    await page.wait_for_timeout(3000)
                 else:
                     logger.warning(
-                        f"⚠️ {self.scraper_name}: Nenašel jsem pole pro filtr. Pokračuji bez něj."
+                        f"⚠️ {self.scraper_name}: Vyhledávací rozhraní nenalezeno."
                     )
 
-                # Krátký iterativní cyklus přes profiltrovaný obsah
                 page_num = 1
                 while True:
-                    await page.wait_for_selector("table.a-IRR-table", timeout=15000)
+                    # Počkáme, až se objeví alespoň jeden odkaz s ID_MAJ (důkaz datové přítomnosti)
+                    try:
+                        await page.wait_for_selector(
+                            'table.a-IRR-table a[href*="ID_MAJ"]', timeout=15000
+                        )
+                    except Exception:
+                        logger.warning(
+                            f"⚠️ {self.scraper_name}: Nenašel jsem žádná data na stránce {page_num}."
+                        )
+                        break
+
                     html_content = await page.content()
 
                     new_items = self._parse_page_content(html_content)
-                    valid_items.extend(new_items)
+
+                    # Deduplikace na úrovni čtení (pokud AJAX nestihl překreslit, ignorujeme)
+                    unique_new_items = []
+                    for item in new_items:
+                        if item.source_id not in seen_ids:
+                            seen_ids.add(item.source_id)
+                            unique_new_items.append(item)
+
+                    valid_items.extend(unique_new_items)
                     logger.info(
-                        f"{self.scraper_name}: Extrahováno {len(new_items)} platných položek ze stránky {page_num}."
+                        f"{self.scraper_name}: Ze stránky {page_num} extrahováno {len(unique_new_items)} unikátních platných položek (z {len(new_items)} načtených)."
                     )
 
                     next_button = page.locator(
                         "button.a-IRR-button--pagination:has(.icon-right-chevron)"
-                    )
+                    ).first
 
                     if (
                         await next_button.count() > 0
                         and not await next_button.is_disabled()
                     ):
-                        await next_button.click()
+                        # Klikneme a explicitně počkáme na AJAXovou "točící se" ikonu, nebo alespoň dostatečně dlouho
+                        await next_button.evaluate("node => node.click()")
                         await page.wait_for_load_state("networkidle")
-                        await page.wait_for_timeout(1000)  # Necháme DOM nadechnout
+
+                        # ČEKACÍ SMYČKA: Vynutíme čekání na změnu (3 vteřiny by měly na APEX stačit)
+                        logger.debug(
+                            f"{self.scraper_name}: Čekám na synchronizaci DOMu..."
+                        )
+                        await page.wait_for_timeout(3000)
+
                         page_num += 1
                     else:
                         logger.info(
