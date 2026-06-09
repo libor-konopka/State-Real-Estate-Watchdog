@@ -20,6 +20,7 @@ class Estate(SQLModel, table=True):
     property_type: str = Field(index=True)  # "Pozemky" / "Stavby"
 
     title: str
+    description: Optional[str] = None
     starting_price: Optional[float] = None
     estimated_price: Optional[float] = None
     price_per_m2: Optional[float] = None  # Vypočtená metrika

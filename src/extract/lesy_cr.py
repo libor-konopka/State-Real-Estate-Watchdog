@@ -17,7 +17,7 @@ class LesyCrScraper(BaseScraper):
     """
     Asynchronní extraktor pro pnm.lesycr.cz (Strana 7).
     Aplikuje UI filtr a využívá relativní kotevní strategii pro maximální odolnost
-    vůči strukturálním změnám APEX tabulek.
+    vůči strukturálním změnám APEX tabulek. Zahrnuje hloubkovou chirurgickou extrakci popisu.
     """
 
     def __init__(self) -> None:
@@ -46,6 +46,38 @@ class LesyCrScraper(BaseScraper):
             return match.group(1)
         return None
 
+    def _parse_description(self, html_content: str) -> Optional[str]:
+        """Chirurgicky extrahuje pouze text z pole Popis, ignoruje okolní balast."""
+        soup = BeautifulSoup(html_content, "html.parser")
+
+        # Strategie 1: APEX konvence. Prvek Popis na straně 13 má obvykle ID P13_POPIS
+        target = soup.find(id="P13_POPIS")
+        if target:
+            return (
+                target.text.strip()
+                if target.name == "textarea"
+                else target.get_text(separator=" ", strip=True)
+            )
+
+        # Strategie 2: Hledání přes vazbu štítku <label for="...">
+        label = soup.find("label", string=re.compile(r"^\s*Popis\s*$"))
+        if label and label.get("for"):
+            target = soup.find(id=label["for"])
+            if target:
+                return (
+                    target.text.strip()
+                    if target.name == "textarea"
+                    else target.get_text(separator=" ", strip=True)
+                )
+
+        # Strategie 3: Fallback na vyhledání textarey (popis je většinou jediná/největší textarea na detailu)
+        textareas = soup.find_all("textarea")
+        if textareas:
+            # Vezmeme tu s nejdelším textem
+            return max([ta.text.strip() for ta in textareas], key=len)
+
+        return None
+
     def _parse_page_content(self, html_content: str) -> List[EstateSchema]:
         """Těží data pomocí precizního kotevního bodu, eliminuje historický šum i falešné shody."""
         items: List[EstateSchema] = []
@@ -53,7 +85,6 @@ class LesyCrScraper(BaseScraper):
 
         rows = soup.find_all("tr")
         for row in rows:
-            # 1. Detekce platného uzlu
             a_tag = row.find("a", href=re.compile(r"ID_MAJ:(\d+)"))
             if not a_tag:
                 continue
@@ -66,38 +97,54 @@ class LesyCrScraper(BaseScraper):
             try:
                 cells = row.find_all("td")
 
-                # 2. Precizní ukotvení: Hledáme buňku, která je EXACTNĚ slovem 'Prodej'
                 anchor_idx = -1
                 for i, cell in enumerate(cells):
-                    cell_text = cell.get_text(strip=True)
-                    if cell_text == "Prodej":
+                    if cell.get_text(strip=True) == "Prodej":
                         anchor_idx = i
                         break
 
-                # Zvýšení ochranné hranice na 8.
-                # Pokud extrahujeme 8 prvků vlevo od kotvy, pole musí být dostatečně hluboké.
-                if anchor_idx < 8:
+                if anchor_idx < 7:
                     continue
 
-                # 3. Relativní extrakce parametrů vůči kotvě
-                # POZOR: Indexy musíš zkalibrovat podle skutečného pořadí sloupců na webu.
-                # Předpokládám, že Kategorie (-7) je mezi Názvem (-8) a Cenou (-6).
-                title = cells[anchor_idx - 8].text.strip()
-                raw_kategorie = cells[anchor_idx - 7].text.strip()
-                price_str = cells[anchor_idx - 6].text.strip()
-                date_str = cells[anchor_idx - 5].text.strip()
-                region = cells[anchor_idx - 4].text.strip()
-                district = cells[anchor_idx - 3].text.strip()
+                full_row_text = row.get_text(separator=" ", strip=True).lower()
 
-                area_m2_str = cells[anchor_idx - 2].text.strip()
+                property_type = None
+                if "pozemk" in full_row_text:
+                    property_type = "Pozemky"
+                else:
+                    stavby_whitelist = [
+                        "byty a nebytové prostory",
+                        "ostatní",
+                        "provozní budovy",
+                        "rodinné a bytové domy",
+                    ]
+                    if any(stavba in full_row_text for stavba in stavby_whitelist):
+                        property_type = "Stavby"
+
+                if not property_type:
+                    continue
+
+                title = (
+                    cells[anchor_idx - 7].text.strip()
+                    if anchor_idx >= 7
+                    else "Neznámý název"
+                )
+                price_str = (
+                    cells[anchor_idx - 6].text.strip() if anchor_idx >= 6 else ""
+                )
+                date_str = cells[anchor_idx - 5].text.strip() if anchor_idx >= 5 else ""
+                region = cells[anchor_idx - 4].text.strip() if anchor_idx >= 4 else ""
+                district = cells[anchor_idx - 3].text.strip() if anchor_idx >= 3 else ""
+
+                area_m2_str = (
+                    cells[anchor_idx - 2].text.strip() if anchor_idx >= 2 else ""
+                )
                 area_m2_str = "".join(filter(str.isdigit, area_m2_str))
                 area_m2 = float(area_m2_str) if area_m2_str else None
 
-                cadastral_area = cells[anchor_idx - 1].text.strip()
-
-                # Pythonic klasifikace (Ternární operátor).
-                # Cokoliv co není exaktně "Pozemky", propadá do "Stavby".
-                property_type = "Pozemky" if raw_kategorie == "Pozemky" else "Stavby"
+                cadastral_area = (
+                    cells[anchor_idx - 1].text.strip() if anchor_idx >= 1 else ""
+                )
 
                 estate = EstateSchema(
                     source_id=item_id,
@@ -115,6 +162,7 @@ class LesyCrScraper(BaseScraper):
                     seller_institution="Lesy ČR",
                     url=f"https://pnm.lesycr.cz/apex/{href}",
                     area_m2=area_m2,
+                    description=None,
                 )
                 items.append(estate)
 
@@ -130,16 +178,16 @@ class LesyCrScraper(BaseScraper):
             f"📡 {self.scraper_name}: Zhmotňuji headless prohlížeč pro stranu 7..."
         )
         valid_items: List[EstateSchema] = []
-        seen_ids = (
-            set()
-        )  # Ochrana proti zachycení stejných dat (tzv. "ghost" řádky při rychlém čtení)
+        seen_ids = set()
 
         async with async_playwright() as p:
             browser = await p.chromium.launch(headless=True)
             context = await browser.new_context(
                 user_agent=self.get_default_headers()["User-Agent"]
             )
+
             page = await context.new_page()
+            detail_page = await context.new_page()
 
             try:
                 await page.goto(self.base_url, wait_until="networkidle")
@@ -154,7 +202,6 @@ class LesyCrScraper(BaseScraper):
                 if await search_input.count() > 0 and await search_button.count() > 0:
                     await search_input.fill("Vypsané")
                     await search_button.click()
-                    # Zvýšený timeout po filtru pro zajištění prvotního renderu
                     await page.wait_for_load_state("networkidle")
                     await page.wait_for_timeout(3000)
                 else:
@@ -164,7 +211,6 @@ class LesyCrScraper(BaseScraper):
 
                 page_num = 1
                 while True:
-                    # Počkáme, až se objeví alespoň jeden odkaz s ID_MAJ (důkaz datové přítomnosti)
                     try:
                         await page.wait_for_selector(
                             'table.a-IRR-table a[href*="ID_MAJ"]', timeout=15000
@@ -176,19 +222,45 @@ class LesyCrScraper(BaseScraper):
                         break
 
                     html_content = await page.content()
-
                     new_items = self._parse_page_content(html_content)
 
-                    # Deduplikace na úrovni čtení (pokud AJAX nestihl překreslit, ignorujeme)
                     unique_new_items = []
                     for item in new_items:
                         if item.source_id not in seen_ids:
                             seen_ids.add(item.source_id)
+
+                            # --- CHIRURGICKÁ EXTRAKCE DETAILU ---
+                            try:
+                                await detail_page.goto(
+                                    str(item.url), wait_until="domcontentloaded"
+                                )
+                                detail_html = await detail_page.content()
+
+                                desc = self._parse_description(detail_html)
+
+                                if desc:
+                                    item.description = " ".join(desc.split())
+                                    logger.debug(
+                                        f"Získán detail pro inzerát {item.source_id}"
+                                    )
+                                else:
+                                    logger.warning(
+                                        f"Popis nenalezen pro {item.source_id}"
+                                    )
+                                    item.description = None
+
+                            except Exception as e:
+                                logger.warning(
+                                    f"Selhání průniku do detailu {item.source_id}: {e}"
+                                )
+                                item.description = None
+                            # ------------------------------------
+
                             unique_new_items.append(item)
 
                     valid_items.extend(unique_new_items)
                     logger.info(
-                        f"{self.scraper_name}: Ze stránky {page_num} extrahováno {len(unique_new_items)} unikátních platných položek (z {len(new_items)} načtených)."
+                        f"{self.scraper_name}: Ze stránky {page_num} extrahováno {len(unique_new_items)} unikátních platných položek."
                     )
 
                     next_button = page.locator(
@@ -199,16 +271,9 @@ class LesyCrScraper(BaseScraper):
                         await next_button.count() > 0
                         and not await next_button.is_disabled()
                     ):
-                        # Klikneme a explicitně počkáme na AJAXovou "točící se" ikonu, nebo alespoň dostatečně dlouho
                         await next_button.evaluate("node => node.click()")
                         await page.wait_for_load_state("networkidle")
-
-                        # ČEKACÍ SMYČKA: Vynutíme čekání na změnu (3 vteřiny by měly na APEX stačit)
-                        logger.debug(
-                            f"{self.scraper_name}: Čekám na synchronizaci DOMu..."
-                        )
                         await page.wait_for_timeout(3000)
-
                         page_num += 1
                     else:
                         logger.info(

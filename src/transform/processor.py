@@ -35,8 +35,9 @@ class DataTransformer:
         schema_overrides = {
             "source_id": pl.String,
             "source_portal": pl.String,
-            "property_type": pl.String,  # Přidáno do Polars schématu
+            "property_type": pl.String,
             "title": pl.String,
+            "description": pl.String,
             "starting_price": pl.Float64,
             "estimated_price": pl.Float64,
             "location_region": pl.String,
@@ -98,38 +99,61 @@ class DataTransformer:
         self._upsert_to_db(clean_df)
 
     def _upsert_to_db(self, df: pl.DataFrame) -> None:
-        """Inteligentní uložení hmoty (Upsert). Existující záznamy aktualizuje, nové vkládá."""
+        """
+        Inteligentní uložení hmoty (Upsert) a následná automatická
+        synchronizace stavu (odstranění neaktivních inzerátů).
+        """
         logger.info("Ukotvuji data v relační paměti (SQLite)...")
-        records = df.to_dicts()
-        inserted = 0
-        updated = 0
+        records: list[dict[str, any]] = df.to_dicts()
+        inserted: int = 0
+        updated: int = 0
+
+        # Vytvoření indexu klíčů z aktuální dávky pro O(1) vyhledávání
+        current_keys: set[tuple[str, str]] = {
+            (r["source_portal"], r["source_id"]) for r in records
+        }
+        # Seznam portálů, které v této vlně aktualizujeme
+        active_portals: list[str] = list({r["source_portal"] for r in records})
 
         with Session(self.engine) as session:
+            # FÁZE 1: Upsert (Zhmotnění přítomnosti)
             for record in records:
-                # Pokus o nalezení existující energie podle přirozeného klíče
                 statement = select(Estate).where(
                     Estate.source_portal == record["source_portal"],
-                    Estate.source_id == record["source_id"],
+                    Estate.source_id == record["source_id"]
                 )
                 existing_estate = session.exec(statement).first()
 
                 if existing_estate:
-                    # Aktualizace existující hmoty
                     for key, value in record.items():
                         setattr(existing_estate, key, value)
                     session.add(existing_estate)
                     updated += 1
                 else:
-                    # Vložení nové hmoty
                     new_estate = Estate(**record)
                     session.add(new_estate)
                     inserted += 1
 
+            # Vynucení zápisu do DB před čistkou
             session.commit()
 
-        logger.info(
-            f"Ukotvení dokončeno: {inserted} nových, {updated} aktualizovaných záznamů."
-        )
+            # FÁZE 2: Synchronizace (Odstranění entit, které opustily zdrojový prostor)
+            db_estates = session.exec(
+                select(Estate).where(Estate.source_portal.in_(active_portals))
+            ).all()
+
+            deleted: int = 0
+            for estate in db_estates:
+                key = (estate.source_portal, estate.source_id)
+                if key not in current_keys:
+                    session.delete(estate)
+                    deleted += 1
+
+            if deleted > 0:
+                session.commit()
+                logger.info(f"Čistka dokončena: Odstraněno {deleted} neaktivních stínů minulosti.")
+
+        logger.info(f"Ukotvení dokončeno: {inserted} nových, {updated} aktualizovaných záznamů.")
 
 
 if __name__ == "__main__":

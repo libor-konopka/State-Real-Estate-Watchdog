@@ -28,6 +28,9 @@ class EstateSchema(BaseModel):
         ...,
         description="Hlavní název nebo stručný popis nemovitosti."
     )
+    description: Optional[str] = Field(
+        None, description="Detailní textový popis nemovitosti z hloubkového průzkumu."
+    )
 
     # 2. Finanční osa
     starting_price: Optional[float] = Field(
